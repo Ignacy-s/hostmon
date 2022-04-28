@@ -1,0 +1,771 @@
+#!/bin/bash
+
+# ins:
+# Manage instances file.
+
+# Instances are called vms and are divided into projects.
+# It is assumed that the machine/vm name is the same as it's hostname.
+
+
+usage(){
+  keyword="${1}"
+  case "${keyword}" in
+    add)
+      cat - >&2 <<EOF
+Usage: ${0##*/} add PROJECT [MACHINE] INSTANCE_FILE < STDIN
+  add - adds machines to projects. It takes details of one machine
+   from STDIN and inserts it in the INSTANCE_FILE in PROJECT as
+   MACHINE. You can also add just a project name, but it's not
+   necessary to have a project in the file to add machines to it.
+EOF
+      ;;
+    del)
+      cat - >&2 <<EOF
+Usage: ${0##*/} del PROJECT MACHINE|all INSTANCE_FILE
+  del PROJECT MACHINE - deletes MACHINE from PROJECT.
+  del PROJECT all - deletes a whole PROJECT.
+EOF
+      ;;
+    let)
+      cat - >&2 <<EOF
+Usage: ${0##*/} let PROJECT MACHINE VAR_NAME [VAR_VALUE] INSTANCE_FILE
+  let PROJECT MACHINE VAR_NAME VAR_VALUE - add/set a variable VAR_NAME
+   with value VAR_VALUE
+  let PROJECT MACHINE VAR_NAME - add/set a variable VAR_NAME without
+   any value.
+  WARNING: No spaces allowed in VAR_NAME! The line is separated into
+  strings using whitespaces as a separator. Everything after the first
+  whitespace is considered part of the VAR_VALUE.
+EOF
+      ;;
+    replace)
+      cat - >&2 <<EOF
+Usage: ${0##*/} replace PROJECT MACHINE INSTANCE_FILE < STDIN
+  replace - deletes MACHINE from PROJECT and adds a new one in it's
+   place, taking details from STDIN.
+EOF
+      ;;
+    list)
+      cat - >&2 <<EOF
+Usage: ${0##*/} list PROJECT [MACHINE|all] INSTANCE_FILE
+  list FILE - lists all project names in the INSTANCE_FILE.
+  list PROJECT FILE - list all machine names in PROJECT.
+  list PROJECT MACHINE FILE - list details of a MACHINE in
+   PROJECT.
+  ins list PROJECT all FILE - list details of all machines in the
+  PROJECT.
+EOF
+      ;;
+    *)
+      cat - >&2 <<EOF
+Usage: ${0##*/} add|del|list|replace|let PROJECT [MACHINE] INSTANCE_FILE
+
+Manage instances file.
+
+'ins KEYWORD help' to get more detailed info, short
+info here:
+
+add - adds a new machine from STDIN
+del - deletes a machine or a project
+list - lists project, machine names or machine details
+replace - updates details of a machine, using STDIN
+let - updates a variable in a machine description
+
+Example instances file:
+[project: icinga-demo]
+[vm: icinga-demo]
+ID                       a21d8e8d-cfdb
+Hostname                 icinga-demo
+PublicIP.ID              9c7cfd06-b7f4
+PublicIP.Address         
+Zone			 
+[/vm]
+[/project]
+EOF
+      ;;
+    
+  esac
+}
+
+debug_flag="0"
+
+# REQUIREMENT:
+# ins uses itself and has to be in the PATH.
+if ! command -v ins > /dev/null ; then
+  echo -n "${0##*/} is not in PATH, " >&2
+  inspath="${0%/*}"
+  [[ "$inspath" = "." ]] && inspath="$(pwd)"
+  echo -e "ins can be found in:\n $inspath" >&2
+  exit 1
+fi
+
+# FUNCTIONS
+# Exit on fail.
+die(){
+  local error_msg="${*}"
+  echo -e "Error in ${0##*/}:\n $error_msg" >&2
+  echo "Exiting $0." >&2
+  exit 1
+}
+
+debug(){
+  local debug_message="${*}"
+  if [[ debug_flag -eq 1 ]]; then
+    echo -e "debug: $debug_message"
+  fi
+}
+
+backup(){
+  local instances_file="${1}"
+  # Check if there was backup done this minute.
+  if [[ -f "${instances_file}.bak.$(date +%F-%H:%M)" ]]; then
+    debug "Instances already backed up,
+    	    time of backup:$(date +%F-%H:%M)."
+  else
+    # Backup instances.
+    debug "Backing up instances to .bak.$(date +%F-%H:%M)."
+    cp "${instances_file}"{,.bak."$(date +%F-%H:%M)"} \
+      || die 'cp "${instances_file}"{,.bak."$(date +%F-%H:%M)"}'
+  fi
+  return 0
+}
+
+# Verifies that the instances file is sane.
+# All projects have an end and no new project starts before the
+# previous ends, same for VMs. Removes empty lines. Fixes the file if
+# any errors are encountered. Calls error if there are duplicate
+# names.
+verify_instances_file(){
+  debug "Inside verify_instances_file function."
+  local instances_file="${1}"
+  if [[ ! -s "${instances_file}" ]]; then
+    die "Instances file \"${instances_file}\" doesn't exist or is empty."
+  fi
+
+
+  # VALIDATE AND FIX OPEN/CLOSE LINES
+  local pro_open=0
+  local vm_open=0
+  local check_pro=0  # To avoid surplus endings, after endings we have 
+  local check_vm=0   # to check if the next line opens a new vm/project.
+  local current_line=0
+  ## In sed '$' is the address of the last line, and '=' prints the
+  ## line number of the match instead of the match.
+  local last_line
+  last_line="$(sed -n '$=' "${instances_file}")"
+
+  while [[ current_line -lt last_line ]] ; do
+    (( current_line++ ))
+    line="$(sed -n "${current_line}p" "${instances_file}")"
+       
+    # Check if $line opens a new vm.
+    if [[ "$line" =~ ^\s*\[vm:.*\]\s*$ ]]; then
+      # Check if a vm is already open, close it if needed.
+      if [[ vm_open -eq 1 ]]; then
+	sed --in-place --follow-symlinks \
+	    "${current_line}i\[\/vm\]"\
+	    "${instances_file}"
+	vm_open=0
+	((current_line++))
+	((last_line++))
+      fi
+      check_vm=0
+      vm_open=1
+    fi  
+    # Check if $line opens a new project.
+    if [[ "$line" =~ ^\s*\[project:.*\]\s*$ ]]; then
+      # Check if a vm is already open, close it if needed.
+      if [[ vm_open -eq 1 ]]; then
+	debug "Instance verify: New project, closing vm, line ${current_line}."
+	sed --in-place --follow-symlinks \
+	    "${current_line}i\[\/vm\]"\
+	    "${instances_file}"
+	vm_open=0
+	((current_line++))
+	((last_line++))
+      fi
+      # Check if a project is already open, close it if needed.
+      if [[ pro_open -eq 1 ]]; then
+	debug "Instance verify: closing project, line ${current_line}."
+	sed --in-place --follow-symlinks \
+	    "${current_line}i\[\/project\]"\
+ 	    "${instances_file}"
+	pro_open=0
+	((current_line++))
+	((last_line++))
+      fi
+      check_vm=0
+      check_pro=0
+      pro_open=1
+    fi
+    
+    # Fix edge case of last vm in project and last project in file.
+    if [[ "$line" =~ ^\s*\[\/project\]\s*$ ]]; then
+      # Have to set the flag here, before "remove pro/vm ends" part.
+      check_vm=0
+    fi
+    if [[ "$line" =~ ^\s*$ && current_line -eq last_line ]]; then
+      # Avoid extra project end removal at the last line.
+      check_pro=0
+    fi
+    
+    # Remove pro/vm ends if they are not immediately followed by a new
+    # vm/project (in case of a vm) or project/endOfFile for projects.
+    if [[ check_vm -eq 1 ]]; then
+      debug "ins:ver: check_vm=1: vm end removal activated," 
+      debug "current_line=${current_line}, last_line=${last_line}"
+      debug "previous and current lines are:"
+      prev_line=$((current_line - 1))
+      echo -n "prev, ${prev_line}:" >&2
+      sed -n "${prev_line}p" "${instances_file}"
+      echo -n "curr, ${current_line}:" >&2
+      sed -n "${current_line}p" "${instances_file}"
+      check_vm=0
+      vm_open=1
+      ((current_line--))
+      ((last_line--))
+      debug "ins ver: Deleting vm end at line ${current_line}."
+      sed --in-place --follow-symlinks \
+	  "${current_line}d"\
+	  "${instances_file}"
+    fi
+    if [[ check_pro -eq 1 ]]; then
+      debug "ins:ver: check_pro=1: pro end removal activated," 
+      debug "current_line=${current_line}, last_line=${last_line}"
+      debug "previous and current lines are:"
+      prev_line=$((current_line - 1))
+      echo -n "prev, ${prev_line}:" >&2
+      sed -n "${prev_line}p" "${instances_file}"
+      echo -n "curr, ${current_line}:" >&2
+      sed -n "${current_line}p" "${instances_file}"
+      
+      check_pro=0
+      pro_open=1
+      ((current_line--))
+      ((last_line--))
+      debug "ins ver: Deleting project end at line ${current_line}."
+      sed --in-place --follow-symlinks \
+	  "${current_line}d"\
+	  "${instances_file}"
+    fi
+
+    # Remove empty lines.
+    if [[ "$line" =~ ^\s*$ ]]; then
+      sed --in-place --follow-symlinks \
+	  "${current_line}d"\
+	  "${instances_file}"
+      ((current_line--))
+      ((last_line--))
+    fi
+
+    # Check if line closes vm or project.
+    if [[ "$line" =~ ^\s*\[\/vm\]\s*$ ]]; then
+      check_vm=1
+      vm_open=0
+    fi
+    if [[ "$line" =~ ^\s*\[\/project\]\s*$ ]]; then
+      check_pro=1
+      pro_open=0
+    fi
+  done
+
+  # Check if at the end there are still open pro/vms.
+  # Check if a vm is already open, close it if needed.
+  if [[ vm_open -eq 1 ]]; then
+    debug "Instance verify: closing vm, line ${current_line}."
+    sed --in-place --follow-symlinks \
+	'$a\[\/vm\]'\
+	"${instances_file}"
+  fi
+  # Check if a project is already open, close it if needed.
+  if [[ pro_open -eq 1 ]]; then
+    debug "Instance verify: closing project, line ${current_line}."
+    sed --in-place --follow-symlinks \
+	"\$a\[\/project\]"\
+	"${instances_file}"
+  fi
+  
+
+  # THINGS OTHER THAN OPEN/CLOSE VALIDATION
+  # Insert a newline '\n' at the end of file if it's not there.
+  sed --in-place --follow-symlinks \
+	  '$a\' \
+	  "${instances_file}"
+
+  # Check for duplicate project names.
+  duplicate_projects="$(grep '\[project:' "${instances_file}" |
+    sed -e 's#^\s*\[project:\s*##' -e 's#\s*\]\s*$##' |
+    sort |
+    uniq -d )"
+  if [[ -n "${duplicate_projects}" ]]; then
+    die "There are duplicate project names: ${duplicate_projects}."
+  fi
+
+  # Create an array with project names.
+  projects_array=()
+  while read -r; do
+    projects_array+=("${REPLY}")
+  done < <( grep '\[project:' "${instances_file}" |
+	      sed 's#^\s*\[project:\s*##' |
+	      sed 's#\s*\]\s*$##' )
+  # Check for duplicate VM names.
+  for pro in "${projects_array[@]}"; do
+    sed_upper_limit='\#^\s*\[project:\s*'"${pro}"'\s*\]\s*$#'
+    sed_lower_limit='\#^\s*\[\s*/project\s*\]\s*$#'
+    duplicate_machines="$(
+      sed -n "${sed_upper_limit},${sed_lower_limit} p"\
+        "${instances_file}" |
+      grep '\[vm:' |
+      sed -e 's#^\s*\[vm:\s*##' -e 's#\s*\]\s*$##' |	
+      sort |		       
+      uniq -d )"		       
+    if [[ -n "${duplicate_machines}" ]]; then
+      die "Duplicate machine names in project '${pro}': ${duplicate_machines}."
+    fi
+  done
+  
+  return 0
+}
+
+# Inserts file inside another file.
+insert_in_file(){
+  # Error if wrong number of arguments.
+  [[ $# -ne 3 ]] && die 'Wrong number of arguments for insert.'
+  source_file="${1}"      # File to insert.
+  destination_file="${2}" # Destination file.
+  line_insert="${3}"      # Line to insert after.
+    
+  # Create a temporary file to hold results.
+  tempfile_ins=$(mktemp) || die "Failed to create a tempfile_ins."
+  trap 'rm -f ${tempfile_ins}; exit' EXIT
+
+  # Code block to create the new file.
+  {
+    head -"$line_insert" "$destination_file"
+    cat "$source_file" \
+      || die 'cat "$source_file"'
+    tail -n +$((++line_insert)) "$destination_file"
+  } > "$tempfile_ins"
+
+  # Inserting the new file in the place of the other.
+  cat "$tempfile_ins" > "$destination_file" \
+    || die 'cat "$tempfile_ins" > "$destination_file"'
+}
+
+# Tests if name contains only alphanumerics, '-' and '_'.
+test_name(){
+  local name
+  name="${1}"
+
+  if [[ "${name}" =~ ^[a-zA-Z0-9_-]+$ ]]; then
+    debug "Name \"${name}\" contains only alphanumerics, '-' and '_'."
+    return 0
+  else
+    die "Illegal name: \"${name}\".\n\tNames can contain only alphanumerics, '-' and '_'."
+    return 1
+  fi
+}
+
+test_if_project_exists(){
+  # Return 0 if project exist in the instances file, else return 1.
+  local project="${1}"
+
+  if [[ ${#} -ne 1 ]]; then
+    die 'Wrong number of arguments in test_if_project_exists().'
+  fi
+  
+
+  # grep will succeed only if there is an exact match in ins list
+  # output. ins list prints all projects in the instances file, one
+  # project per line.
+  ins list "${instances}" \
+    | grep -qx "${project}" \
+    && return 0 \
+      || return 1
+}
+
+test_if_in_project_vm_exists(){
+  # Return 0 if vm exists in project, else return 1.
+  local project="${1}"
+  local vm="${2}"
+
+  if [[ ${#} -ne 2 ]]; then
+    die 'Wrong number of arguments in test_if_in_project_vm_exists().'
+  fi
+
+  # grep will succeed only if there is an exact match in ins list
+  # $project output. ins list $project prints all machines in the
+  # $project in instances file, one machine per line.
+  ins list "${project}" "${instances}" \
+    | grep -qx "${vm}" \
+    && return 0 \
+      || return 1
+}
+
+
+# Main
+main(){
+  # Exit if not enough arguments.
+  if [[ ${#} -lt 2 ]]; then
+    usage "${1}"
+    exit 1
+  fi
+    
+  for arg in "${@}"; do
+    if [[ "${arg}" = 'help' ||\
+	    "${arg}" = '-h' ||\
+	    "${arg}" = '--help' ]]; then
+      usage "${1}"
+      exit 1
+    fi
+  done
+  
+  # Variables:
+  keyword="$1"
+  instances="${@: -1}"
+
+  case "$keyword" in
+    add)
+    # For adding new vms from STDIN.
+      # If not enough arguments.
+      if [[ ${#} -eq 2 ]]; then
+	usage add
+	exit 1
+      fi
+      # If only 3 arguments (just project name).
+      if [[ ${#} -eq 3 ]]; then
+	debug "Add with 3 arguments, creating project."
+        # Don't verify if file is empty.
+	if [[ -s "${instances}" ]]; then
+	  backup "${instances}" \
+	    || die 'backup "{instances}"'
+   	 verify_instances_file "$instances" \
+	    || die 'verify_instances_file "instances"'
+	fi
+        project_name="$2"
+        test_name "${project_name}"
+
+	# Check if project already exists.
+	grep -q "^\s*\[project: ${project_name}\s*\]\s*$" "${instances}" \
+	   &>/dev/null # Don't want grep complaining if file doesn't exist.
+	if [[ ${?} -eq 0 ]]; then
+	  die "Project ${project_name} already exists."
+	else
+	  echo "[project: ${project_name}]" >> "${instances}"
+	  echo "[/project]" >> "${instances}"
+	fi
+      fi
+      # Regular - 4 arguments (project name and vm name given).
+      if [[ ${#} -eq 4 ]]; then
+        # Don't verify if file is empty.
+	if [[ -e "${instances}" ]]; then
+	  backup "${instances}" \
+	    || die 'backup "{instances}"'
+  	  verify_instances_file "$instances" \
+	    || die 'verify_instances_file "instances"'
+	fi
+	project_name="$2"
+        test_name "${project_name}"
+	vm_name="$3"
+        test_name "${vm_name}"
+	debug "Add: vm ${vm_name} in project ${project_name}."
+	# Check if project already exists.
+	grep -q "^\s*\[project: ${project_name}\s*\]\s*$" "${instances}"
+	if [[ ${?} -eq 0 ]]; then
+	  debug "Project ${project_name} already exists."
+	  sed_upper_limit='\#^\s*\[project:\s*'"${project_name}"'\s*\]\s*$#'
+	  sed_lower_limit='\#^\s*\[\s*/project\s*\]\s*$#'
+	  entry_line=$(
+	    sed -n "${sed_upper_limit},${sed_lower_limit}="\
+		"${instances}" |
+	      tail -1 )
+	  ((entry_line--)) # -- because insert inserts after a line.
+	else
+	  debug "Project not found, creating."
+	  echo "[project: ${project_name}]" >> "${instances}"
+	  entry_line=$( sed -n '$=' "${instances}" )
+	  echo "[/project]" >> "${instances}"
+	fi
+
+	# Check if vm already exists.
+	ins list "${project_name}" "${instances}" |
+  	  grep -q "${vm_name}"
+	if [[ ${?} -eq 0 ]]; then
+	  echo "Machine '${vm_name}' already exists." >&2
+	  usage add
+	  exit 1
+	fi
+	# Create a temporary file to hold results.
+	tempfile_add=$(mktemp) || die "Failed to create a tempfile_add."
+	trap 'rm -f ${tempfile_add}; exit' EXIT
+	# Create a file with vm to add.
+	echo "[vm: ${vm_name}]" > "${tempfile_add}"
+	cat - >> "${tempfile_add}"
+	echo "[/vm]" >> "${tempfile_add}"
+	# Perform the insertion
+	insert_in_file "${tempfile_add}" "${instances}" "${entry_line}" \
+	  || die 'insert_in_file <( cat -) "{instances}" "entry_line"'
+      fi
+	
+      if [[ ${#} -gt 4 ]]; then
+	die "Too many arguments: ${#}."
+      fi
+      ;;
+
+
+    del)
+    # For deleting vms or whole project if vm is 'all'.
+      # If not enough arguments.
+      if [[ ${#} -le 3 ]]; then
+	usage del
+	exit 1
+      fi
+      # If more than 4 arguments.
+      if [[ ${#} -gt 4 ]]; then
+	die "ins del: too many arguments: ${#}."
+      fi
+      # Error if file is empty.
+      if [[ ! -s "${instances}" ]]; then
+	die "ins del: file ${instances} empty or doesn't exist."
+      fi
+      backup "${instances}" \
+	|| die 'backup "${instances}"'
+      verify_instances_file "$instances" \
+	|| die 'verify_instances_file "$instances"'
+
+      # Fill project&vm name vars and check if they exist.
+      project_name="$2"
+      test_name "${project_name}"
+      test_if_project_exists "${project_name}" \
+        || die "Project '${project_name}' doesn't exist."
+      vm_name="$3"
+      test_name "${vm_name}"
+      if [[ "${vm_name}" != "all" ]]; then
+        test_if_in_project_vm_exists "${project_name}" "${vm_name}" \
+          || die "Machine '${vm_name}' doesn't exist in project '${project_name}'."
+      fi
+      
+      debug "ins del, deleting ${vm_name} in project ${project_name}."
+      # Deleting whole project.
+      if [[ "${vm_name}" = 'all' ]]; then
+	sed_upper_limit='\#^\s*\[project:\s*'"${project_name}"'\s*\]\s*$#'
+	sed_lower_limit='\#^\s*\[\s*/project\s*\]\s*$#'
+	sed --follow-symlinks --in-place \
+	    "${sed_upper_limit},${sed_lower_limit} d"\
+	    "${instances}"
+	exit $?
+      fi
+      # Deleting specific vm.
+      # Find where the project begins (to find the offset).
+      pro_offset=$(sed -n \
+      '\#^\s*\[project:\s*'"${project_name}"'\s*\]\s*$# =' \
+      "${instances}")
+      ((pro_offset--))
+      # Create a temporary file to hold results.
+      tempfile_del=$(mktemp) || die "Failed to create a tempfile_del."
+      trap 'rm -f ${tempfile_del}; exit' EXIT
+      sed_upper_limit='\#^\s*\[project:\s*'"${project_name}"'\s*\]\s*$#'
+      sed_lower_limit='\#^\s*\[\s*/project\s*\]\s*$#'
+      sed -n "${sed_upper_limit},${sed_lower_limit} p"\
+	  "${instances}" > "${tempfile_del}"
+      sed_upper_limit='\#^\s*\[vm:\s*'"${vm_name}"'\s*\]\s*$#'
+      sed_lower_limit='\#^\s*\[\s*/vm\s*\]\s*$#'
+      vm_start=$(sed -n "${sed_upper_limit},${sed_lower_limit} ="\
+		     "${tempfile_del}" | head -1)
+      ((vm_start+=pro_offset))
+      vm_end=$(sed -n "${sed_upper_limit},${sed_lower_limit} ="\
+		   "${tempfile_del}" | tail -1)
+      ((vm_end+=pro_offset))
+      sed --follow-symlinks --in-place \
+	    "${vm_start},${vm_end} d"\
+	    "${instances}"
+      exit $?
+      ;;
+
+
+    replace)
+    # To put a new vm into an occupied name.
+      # Need exactly 4 arguments.
+      if [[ ${#} -ne 4 ]]; then
+	usage replace
+	die "ins replace needs exactly 4 arguments, you supplied ${#}."
+      fi
+
+      # Fill project&vm name vars and check if they exist.
+      project_name="$2"
+      test_name "${project_name}"
+      test_if_project_exists "${project_name}" \
+        || die "Project '${project_name}' doesn't exist."
+      vm_name="$3"
+      test_name "${vm_name}"
+      test_if_in_project_vm_exists "${project_name}" "${vm_name}" \
+        || die "Machine '${vm_name}' doesn't exist in project '${project_name}'."
+      
+      debug "Replacing ${vm_name} in ${project_name}."
+      # No need to backup since del will do it for us.
+      ins del "${project_name}" "${vm_name}" "${instances}" \
+	|| die "ins del ${project_name} ${vm_name} ${instances}" 
+      ins add "${project_name}" "${vm_name}" "${instances}" \
+	||die "ins add ${project_name} ${vm_name} ${instances}"
+      ;;
+
+
+    let)
+      # Set a variable in a VM description (or add it if it doesn't
+      # exist).
+
+      # Need 5 or 6 arguments (with or without VARIABLE_VALUE).
+      if [[ ${#} -le 5 || ${#} -gt 6 ]]; then
+	usage let
+	exit 1
+      fi
+
+      # Assign variables.
+      project_name="${2}"
+      vm_name="${3}"
+      var_name="${4}"
+      var_value="${5}"
+
+      # Put the VM description into a tempfile using ins list.
+      local tempfile_let
+      tempfile_let=$(mktemp) || die "Failed to create a tempfile_let."
+      trap 'rm -f ${tempfile_let}; exit' EXIT
+      ins list "${project_name}" "${vm_name}" "${instances}" \
+          > "${tempfile_let}" \
+          || die "Couldn't save ${project_name}:${vm_name} into tempfile."
+
+      # Check if instance description contains the variable.
+      variable_copies_count="$( awk '{print $1}' "${tempfile_let}" \
+      | grep -xc "${var_name}" )"
+      case "${variable_copies_count}" in
+        0)
+          # If not, add the variable at the bottom.
+          printf '%-25.24s%s\n' "${var_name}" "${var_value}" \
+                 >> "${tempfile_let}" \
+                 || die "Couldn't modify tempfile_let."
+          # TODO: Add variable where relevant instead of at the
+          # bottom. For example group all variables for checks
+          # together.
+          ;;
+        1)
+          # If variable was found, change it's value.
+          # Find at which line variable resides.
+          var_line=$( awk '{print $1}' "${tempfile_let}" \
+                        | grep -xn "${var_name}" \
+                        | cut -d ':' -f 1 )
+          # Signal error if var_line is empty.
+          [[ -z "${var_line}" ]] && die 'var_line empty'
+          # Insert line with new variable value (inserts after the
+          # var_line).
+          insert_in_file \
+            <(printf '%-25.24s%s\n' "${var_name}" "${var_value}") \
+            "${tempfile_let}" \
+            "${var_line}"
+          # Delete the old variable assignment.
+          sed -i "${var_line}"d "${tempfile_let}"
+          ;;
+        ?)
+          debug 'Too many variables in in file or error in grep.'
+          echo \
+            -e "Found ${variable_copies_count} copies of ${var_name}.\n\
+            For this kind of work use 'ins replace'."
+          usage let
+          exit 1
+          ;;
+      esac
+  
+      # Use 'ins replace' to replace the VM description with what's in
+      # the temp file.
+      ins replace "${project_name}" "${vm_name}" "${instances}" \
+          < "${tempfile_let}"
+
+      # Exit successfully.
+      exit 0
+      ;;
+    
+
+    list)
+    # To list contents of a vm or a project.
+    # ('all' showing all details on all vms in a project)
+      # Need 2, 3 or 4 arguments.
+      if [[ ${#} -lt 2 || ${#} -gt 4 ]]; then
+	usage list
+	die "ins list: wrong number of arguments: ${#}."
+      fi
+
+      # Error if instances file is empty.
+      if [[ ! -s "${instances}" ]]; then
+	die "ins list: file \"${instances}\" empty or doesn't exist."
+      fi
+      backup "${instances}" \
+	|| die 'backup "${instances}"'
+      verify_instances_file "${instances}" \
+	|| die 'verify_instances_file "${instances}"'
+
+      # Listing all project names in instances file.
+      if [[ ${#} -eq 2 ]]; then
+	grep '\[project:' "${instances}" |
+	  sed 's#^\s*\[project:\s*##' |
+	  sed 's#\s*\]\s*$##'
+	exit 0
+      fi
+
+      # Listing all vm names in a project.
+      if [[ ${#} -eq 3 ]]; then
+        # Fill project name var and check if it exists.
+        project_name="$2"
+        test_name "${project_name}"
+        test_if_project_exists "${project_name}" \
+          || die "Project '${project_name}' doesn't exist."
+
+        sed_upper_limit='\#^\s*\[project:\s*'"${project_name}"'\s*\]\s*$#'
+        sed_lower_limit='\#^\s*\[\s*/project\s*\]\s*$#'
+        sed -n "${sed_upper_limit},${sed_lower_limit} p" "${instances}" |
+	  grep '\[vm:' |
+	  sed 's#^\s*\[vm:\s*##' |
+	  sed 's#\s*\]\s*$##'
+	exit 0
+      fi
+
+      # If we get here it means there are 4 arguments.
+      # Fill project&vm name vars and check if they exist.
+      project_name="$2"
+      test_name "${project_name}"
+      test_if_project_exists "${project_name}" \
+        || die "Project '${project_name}' doesn't exist."
+      vm_name="$3"
+      test_name "${vm_name}"
+      if [[ "${vm_name}" != "all" ]]; then
+        test_if_in_project_vm_exists "${project_name}" "${vm_name}" \
+          || die "Machine '${vm_name}' doesn't exist in project '${project_name}'."
+      fi
+      
+      # List all details on all vms in a project.
+      if [[ "${vm_name}" = 'all' ]]; then
+	sed_upper_limit='\#^\s*\[project:\s*'"${project_name}"'\s*\]\s*$#'
+	sed_lower_limit='\#^\s*\[\s*/project\s*\]\s*$#'
+	sed -n "${sed_upper_limit},${sed_lower_limit} p" "${instances}"
+	exit 0
+      fi
+
+      # List details on a specific vm:
+      sed_upper_limit='\#^\s*\[project:\s*'"${project_name}"'\s*\]\s*$#'
+      sed_lower_limit='\#^\s*\[\s*/project\s*\]\s*$#'
+      second_upper_limit='\#^\s*\[vm:\s*'"${vm_name}"'\s*\]\s*$#'
+      second_lower_limit='\#^\s*\[\s*/vm\s*\]\s*$#'
+      sed -n "${sed_upper_limit},${sed_lower_limit} p" "${instances}" |\
+	sed -n "${second_upper_limit},${second_lower_limit} p" |\
+	tail -n +2 | head -n -1
+      exit 0
+      ;;
+
+
+    *)
+      usage
+      exit 1
+      ;;
+  esac
+}
+
+main "${@}"
+exit 0

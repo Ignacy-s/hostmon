@@ -1,0 +1,719 @@
+#!/bin/bash
+
+  # Script adding/editing/listing icinga monitored hosts.
+  # It is run on the Icinga master host.
+
+  # Script assumes that, at the time of execution, client machines can
+  # be accessed with ssh using their hostname only. That means their
+  # entries in ssh-config are correctly named and configured.
+
+# GLOBAL VARIABLES:
+readonly SSH_TIMEOUT='2' # In seconds.
+readonly SSH_OPTIONS="-o ConnectTimeout=${SSH_TIMEOUT}"
+
+
+# FLAGS:
+readonly DEBUG_FLAG=1
+set -x
+
+# VARS to be moved to secrets file:
+
+# VARS to be moved to config file:
+readonly INSTANCES_FILE="instances"
+readonly PROJECT="hostmon"
+readonly ICINGA_MASTER="icinga01" # Icinga Master Server
+readonly ICINGA_IP="10.9.8.15"
+readonly ICINGA_ZONE_CONF_DIR='/etc/icinga2/zones.d/master/'
+# START and END lines of the automated block* in conf file.
+readonly START_LINE="// #Automated hostmon Block START"
+readonly END_LINE="// #Automated hostmon Block END"
+# *To allow user have their own checks that hostmon will not modify.
+
+
+# FUNCTIONS
+# Snippet to print things into instances file.
+  #printf '%-25.24s%s\n' $string1 $string2
+  #24 to make sure there is space between varname and varvalue
+
+
+die(){
+# Exit with a message.
+  local error_msg="${*}"
+  echo -e "Error in ${0##*/}:\n $error_msg" >&2
+  echo "Exiting $0." >&2
+  exit 1
+}
+
+debug(){
+# Print a message if the DEBUG_FLAG is set.
+  local debug_message="${*}"
+  if [[ DEBUG_FLAG -eq 1 ]]; then
+    echo -e "debug: $debug_message" >&2
+  fi
+}
+
+error(){
+# Print error to stderr. Maybe do something more in the future.
+  local ERROR_MSG="${*}"
+  echo "${0##*/} error: ${ERROR_MSG}" >&2
+  return 0
+}
+
+usage(){
+# Print usage statement according to the keyword.
+  local keyword="${1}"
+  case "${keyword}" in
+    add)
+      cat - >&2 <<EOF
+Usage: ${0##*/} add MACHINE [-iwd] -a IP_ADDRESS CHECKS[...]
+  add - Set up a new host for monitoring. It will install Icinga and
+   monitoring plugins on a target MACHINE and create a secure
+   connection between the master Icinga server and the machine.
+   It will also set up checks submitted as arguments. After it's
+   finished, it will update the information about the machine that's
+   inside the instances file and print it.
+   Requires MACHINE hostname and an IP_ADDRESS.
+EOF
+      ;;
+    edit)
+      cat - >&2 <<EOF
+Usage: ${0##*/} edit MACHINE [-iwd] [-a IP_ADDRESS] CHECKS[...]
+  edit - Changes what is monitored on the machine or it's IP_ADDRESS
+   and then updates the information inside the instances file.
+EOF
+      ;;
+    list)
+      cat - >&2 <<EOF
+Usage: ${0##*/} list [MACHINE]
+  list - Lists what checks are performed on the target MACHINE.
+   WIP: When finished, it will parse the MACHINE.conf file in Icinga
+   config directory and make sure that checks in the .conf file are
+   the same as those inside the instances file.
+EOF
+      ;;
+    conf*)
+      cat - >&2 <<EOF
+    Config file should contain:
+    - hostname and (???not sure, edit later) ip address of the master
+     icinga server,
+    - name of the instances file
+    - name of the project in the instances file
+
+    Example: (WIP here will be an example, at some point, for now all
+   the variables are hardcoded into the script).
+   
+   For more info about instances file check help in the 'ins' script.
+   You can get it by executing 'ins help'.
+EOF
+      ;;
+    *)
+      cat - >&2 <<EOF
+Usage: ${0##*/} add|edit|list MACHINE
+
+Add hosts to Icinga monitoring.
+
+'hostmon KEYWORD help' to get more detailed info, short
+info here:
+
+add - adds a new machine to monitoring.
+edit - changes checks for a machine.
+list - lists details on a machine or whole project.
+config (help only) -  WIP info on how config file should look.
+
+EOF
+      ;;
+    
+  esac
+}
+
+essh(){
+# Execute a command on a remote host.
+  local NO_ERRORS='0'
+  local SUDO=''
+  # '-s' activates 'sudo' mode.
+  if [[ "${1}" == '-s' ]]; then
+    SUDO='sudo '
+    shift
+  fi
+  if [[ "${1}" == '-e' ]]; then
+    NO_ERRORS='1'
+    shift
+  fi
+  
+  local TARGET="${1}"
+  shift
+  local COMMAND="${*}"
+  ssh "${SSH_OPTIONS}" "${TARGET}" "${SUDO}""${COMMAND}"
+  local EXIT_CODE="${?}"
+  if [[ EXIT_CODE -ne '0' ]]; then    
+    if [[ EXIT_CODE -eq '255' ]]; then
+      error "ssh error when connecting with ${TARGET}."
+    elif [[ NO_ERRORS -ne 1 ]]; then      
+      error "'${COMMAND}' failed on '${TARGET}', exit code: '${EXIT_CODE}'"
+    fi
+    return 1
+  fi
+  return 0
+}
+
+list(){
+  # WIP (not finished)
+  # list a server and it's checks()
+  local HOST="${1}"
+  # List ip address and checks for a server (including check's data
+  # like virtual host name etc.
+
+  # Assuming that all the info inside the instances file is relevant
+  # for hostmon.
+  ins list "${PROJECT}" "${HOST}" "${INSTANCES_FILE}"
+
+  # TODO: add the ability to list checks for all servers ('all'
+  # keyword in place of server name can activate it).
+  # TODO: get the info on active checks through parsing of the icinga
+  # files.
+}
+
+prepare_a_new_host(){
+  # Prepares a new host to be monitored by our Icinga Master.
+  # Requires TARGET_HOST and IP_ADDRESS
+  local TARGET_HOST="${1}"
+  local IP_ADDRESS="${2}"
+  echo "Adding new host '${TARGET_HOST}', ip addr: ${IP_ADDRESS}."
+
+  # Check if there already isn't a host named TARGET_HOST in the
+  # instances file.  
+  if ins list "${PROJECT}" "${INSTANCES_FILE}" \
+      | grep -qx "${TARGET_HOST}" &>/dev/null
+  then
+    error "A host named '${TARGET_HOST}' already exists."
+    return 1
+  fi
+  #TODO: If a host already exists in the instances file, check if all
+  # required host details are there and then check if the host has
+  # been properly setup as icinga host. If not, use the data to add a
+  # new host.
+  
+  # Create a ticket on master.
+  local TICKET_ON_MASTER
+  TICKET_ON_MASTER=$( essh ${ICINGA_MASTER} \
+    "sudo icinga2 pki ticket --cn '${TARGET_HOST}'") \
+    || die "Failed to get a ticket from icinga master."
+  debug "Ticket is: ${TICKET_ON_MASTER}."
+  # Call an error if ticket length is 0.
+  if [[ -z ${TICKET_ON_MASTER} ]]; then
+    error "Failed to generate ticket on Icinga Master."
+    return 1
+  fi
+  
+  # Add Icinga & EPEL repo on client (or others if it's debian
+  # based).
+  debug 'Installing Icinga&EPEL repos if not installed.'
+  # TODO: Make it work on systems other than Centos7
+  ICINGA_REPO_CENTOS7='https://packages.icinga.com/epel/icinga-rpm-release-7-latest.noarch.rpm'
+  # Check if repo isn't already installed.
+  if ! essh "${TARGET_HOST}" \
+       'yum repolist -C | grep -q icinga-stable-release' \
+      &> /dev/null ; then
+    essh "${TARGET_HOST}" sudo yum install -y "${ICINGA_REPO_CENTOS7}" \
+      &> /dev/null \
+      || die "Failed to install Icinga repo on: '${TARGET_HOST}'."
+  fi
+  
+  essh "${TARGET_HOST}" sudo yum install -y epel-release \
+    &> /dev/null \
+    || die "Failed to install EPEL repo on: : '${TARGET_HOST}'."
+  
+  # Install Icinga and Nagios plugins.
+  essh "${TARGET_HOST}" "sudo yum install -y\
+    icinga2 nagios-plugins-all" \
+    &> /dev/null \
+    || die "Failed to install icinga and nagios plugins on:\n\
+     '${TARGET_HOST}'."
+
+  # Generate a local self-signed certificate.
+  essh "${TARGET_HOST}" "sudo icinga2 pki new-cert --cn ${TARGET_HOST} \
+       --key /var/lib/icinga2/certs/${TARGET_HOST}.key \
+       --cert /var/lib/icinga2/certs/${TARGET_HOST}.crt" \
+    &> /dev/null \
+       || die "Failed to generate self-signed cert on '${TARGET_HOST}'."
+  # in this case, the target host is the FQDN of the server.
+
+  # Make sure that port 5665 required for communication with master
+  # icinga server is open.
+  nc -z "${ICINGA_IP}" 5665 \
+     || die "Can't connect to port 5665/tcp on Icinga Master server\n\
+   from ${TARGET_HOST}."
+
+  # The next few steps verify parent connection to avoid MITM attacks.
+  # Request host certificate from icinga master and compare it with
+  # the fingerprint on the master we get from master.
+  debug 'Comparing icinga-master host cert on icinga-master and on target host.'
+  local FINGERPRINT_ON_HOST
+  local FINGERPRINT_ON_MASTER
+  FINGERPRINT_ON_HOST="$( essh "${TARGET_HOST}" \
+  "sudo icinga2 pki save-cert \
+  --trustedcert /var/lib/icinga2/certs/trusted-parent.crt \
+  --host ${ICINGA_MASTER}" \
+  | grep 'Fingerprint:')"
+  # Make sure fingerprint was saved.
+  if [[ -z ${FINGERPRINT_ON_HOST} ]]; then
+    error "Failed to obtain master fingerprint on target host."
+    return 1
+  fi
+  #debug "Fingerprint on host is:"
+  #debug "${FINGERPRINT_ON_HOST}"
+
+  FINGERPRINT_ON_MASTER="$( essh "${ICINGA_MASTER}" \
+    "sudo icinga2 pki verify \
+    --cert /var/lib/icinga2/certs/icinga01.crt" \
+    | grep 'Fingerprint:' )"
+  # Make sure fingerprint was saved.
+  if [[ -z ${FINGERPRINT_ON_MASTER} ]]; then
+    error "Failed to obtain master fingerprint on master."
+    return 1
+  fi
+  #debug "Fingerprint on master is:"
+  #debug "${FINGERPRINT_ON_MASTER}"
+
+  if [[ ! "${FINGERPRINT_ON_HOST}" \
+          = "${FINGERPRINT_ON_MASTER}" ]]; then
+    die "Certificate fingerprint received from master icinga\n\
+    doesn't match the real fingerprint."
+  fi
+
+  # Setup the node. If done manually, this step and cert
+  # check/generation would be done using 'icinga2 node wizard'.
+  debug 'Setting up target host as an agent icinga server.'
+  essh "${TARGET_HOST}" \
+       "sudo icinga2 node setup \
+       --ticket ${TICKET_ON_MASTER} \
+       --cn ${TARGET_HOST} \
+       --endpoint ${ICINGA_MASTER},${ICINGA_IP},5665 \
+       --zone ${TARGET_HOST} \
+       --parent_zone master \
+       --parent_host ${ICINGA_MASTER}\
+       --trustedcert /var/lib/icinga2/certs/trusted-parent.crt \
+       --accept-commands \
+       --accept-config \
+       --disable-confd" \
+    &> /dev/null \
+       || die "Failed to setup new node ${TARGET_HOST}."
+  
+
+  # Start and enable Icinga service on target.
+  essh "${TARGET_HOST}" \
+       "sudo systemctl enable --now icinga2.service" \
+    &> /dev/null \
+       || die "Failed to start and enable icinga on ${TARGET_HOST}."
+  # Restart icinga2.service on master icinga to read in new settings.
+  essh "${ICINGA_MASTER}"\
+       'sudo systemctl restart icinga2.service' \
+    &> /dev/null \
+       || die "Failed to restart icinga on master icinga server."
+
+  # TODO: Check if host was added properly. Couldn't find anything on
+  # it in the icinga docs. Maybe there is something to be found in the
+  # mysql database?
+
+
+  # Define the location of the .conf file.
+  local CONF_FILE="${ICINGA_ZONE_CONF_DIR}${TARGET_HOST}.conf"
+  # Backup conf file before changing anything.
+  if ! essh -s "${ICINGA_MASTER}"\
+          [[ ! -e "${CONF_FILE}" ]]\
+     &>/dev/null ; then
+    backup_file "host:${ICINGA_MASTER}" "${CONF_FILE}" \
+      || die "Failed to backup ${CONF_FILE}."
+  fi
+  # Create .conf file in incinga zone.
+  cat <<EOF | essh -s "${ICINGA_MASTER}"\
+             tee "${CONF_FILE}" >/dev/null
+object Endpoint "${TARGET_HOST}" { 
+  host = "${IP_ADDRESS}" 
+} 
+ 
+object Zone "${TARGET_HOST}" { 
+  endpoints = [ "${TARGET_HOST}" ] 
+  parent = "master" 
+} 
+ 
+object Host "${TARGET_HOST}" { 
+  import "generic-host" 
+  address = "${IP_ADDRESS}" 
+  vars.os = "Linux" 
+  vars.http_vhosts["http"] = { 
+    http_uri = "/" 
+  } 
+  vars.notification["mail"] = { 
+    groups = [ "icingaadmins" ] 
+  } 
+} 
+ 
+${START_LINE}
+${END_LINE}
+EOF
+  # Set permissions on conf file (to avoid root perms).
+  essh -s "${ICINGA_MASTER}"\
+       "chown icinga:icinga ${CONF_FILE}"\
+       || die "Failed to chown icinga:icinga ${CONF_FILE}"
+  essh -s "${ICINGA_MASTER}"\
+       "chmod 640 ${CONF_FILE}"\
+       || die "Failed to chmod 640 ${CONF_FILE}"
+
+  # TODO: run 'sudo icinga2 daemon --validate' to check if conf file
+  # doesn't break icinga.
+
+  # Add/update the new host info in instances file.
+  echo -n "" \
+    | ins add "${PROJECT}" "${TARGET_HOST}" "${INSTANCES_FILE}"
+  ins let "${PROJECT}" "${TARGET_HOST}" 'hostname' "${TARGET_HOST}" \
+      "${INSTANCES_FILE}"
+  ins let "${PROJECT}" "${TARGET_HOST}" 'ip.address' "${IP_ADDRESS}" \
+      "${INSTANCES_FILE}"
+  
+  echo "Finished preparing ${TARGET_HOST} with ip ${IP_ADDRESS}."
+  return 0
+}
+
+set_checks_to_new_values(){
+  # Set checks in /etc/icinga2/zones.d/master conf directory for the
+  # TARGET_HOST to values in options.
+  local TARGET_HOST="${1}"
+  shift
+  echo "Setting checks for ${TARGET_HOST}."
+
+  # Define the location of the .conf file.
+  local CONF_FILE="${ICINGA_ZONE_CONF_DIR}${TARGET_HOST}.conf"
+  # Backup conf file before changing anything.
+  if essh -e "${ICINGA_MASTER}" sudo test -e "${CONF_FILE}"; then
+    backup_file "host:${ICINGA_MASTER}" "${CONF_FILE}" \
+      || die "Failed to backup ${CONF_FILE}."
+  fi
+
+  # Create a temp checks text file.
+  TEMP_CHECKS_FILE=$(mktemp) || die "Failed to create a tempfile."
+  trap 'rm -f ${TEMP_CHECKS_FILE}; exit' EXIT
+
+  debug "Parsing options '${*}' for checks."
+  # Add a check block to the temp file for each CHECK in the options.
+  local CHECK
+  for CHECK in "${@}"; do
+    
+    # Special case for http vhost check.
+    if [[ "${CHECK%%:*}" = 'vhost' ]]; then
+      debug "Mock: handling http check."
+    else
+      # If it's a db check, see if client has been prepared for
+      # database check.
+      if [[ "${CHECK%%:*}" = 'mysql' ]]; then
+	# Check if there are db credentials for the check and if they
+	# work.
+	# TODO: actually do it.
+	
+	# If there are no credentials or they don't work, then prepare
+	# the client for db check.
+	prepare_the_client_for_a_database_check "${TARGET_HOST}"
+      fi
+
+      # Print check block for the CHECK and put it into the temp file
+      # to be put inside the automatic block.
+      print_check "${CHECK}" >> "${TEMP_CHECKS_FILE}"
+    fi
+    # Put the check info in the instances file.
+    ins let "${PROJECT}" "${TARGET_HOST}" \
+	"${CHECK%%:*}" "${CHECK#*:}" \
+	"${INSTANCES_FILE}"
+  done
+
+  # Insert the checks in the automated text block.
+  # Check if there is at most one of START and STOP lines.
+  local HOW_MANY_LINES
+  for LINE in "$START_LINE" "$END_LINE"; do
+    HOW_MANY_LINES="$( essh "${ICINGA_MASTER}" \
+    "sudo grep -c \"${LINE}\" ${CONF_FILE}" )"
+    if [[ $HOW_MANY_LINES -gt 1 ]]; then
+      # Die if there are too many lines, let the user fix this mess.
+      die "There are $HOW_MANY_LINES of $LINE"
+    fi
+  done
+  # Remember where the automatic block starts.
+  local WHERE_IT_STARTED
+  if [[ HOW_MANY_LINES -eq 0 ]]; then
+    # Create a new automated block at the end of the file if it
+    # doesn't exist.
+    WHERE_IT_STARTED="$(essh -s "${ICINGA_MASTER}"\
+                            "sed -n '$ ='" "${CONF_FILE}")"
+  else
+    WHERE_IT_STARTED="$(essh -s "${ICINGA_MASTER}"\
+                            "sed -n '/$START_LINE/ ='" "${CONF_FILE}")"
+    debug "Block starts at: $WHERE_IT_STARTED"
+  fi
+  # Remove old entries.
+  essh -s "${ICINGA_MASTER}"\
+       "sed -i '/$START_LINE/,/$END_LINE/ d'" "${CONF_FILE}" 
+  # Use tempfile to hold output (can't open a file for reading and
+  # writing at the same time).
+  TEMP_OUTPUT_FILE=$(mktemp) || die "Failed to create a tempfile."
+  trap 'rm -f ${TEMP_OUTPUT_FILE}; exit' EXIT
+  # Put the new checks in the tempfile.
+  {
+    #this will "save" the content of "${CONF_FILE}"
+    essh -s "${ICINGA_MASTER}"\
+         head -$((WHERE_IT_STARTED - 1)) "${CONF_FILE}"\
+      || die "Failed 'head'ing the beginning of:\n\
+       ${CONF_FILE}."
+    echo "$START_LINE"
+    cat "${TEMP_CHECKS_FILE}"
+    echo "$END_LINE"
+    essh -s "${ICINGA_MASTER}"\
+         tail -n +"${WHERE_IT_STARTED}" "${CONF_FILE}"\
+      || die "Failed 'tail'ing the end of:\n\
+       ${CONF_FILE}."
+  } > "${TEMP_OUTPUT_FILE}"
+  # Move the file contents to avoid destroying symlinks.
+  essh -s "${ICINGA_MASTER}"\
+       tee "${CONF_FILE}" < "${TEMP_OUTPUT_FILE}"\
+    || die "Failed to overwrite ${CONF_FILE} with\n\
+ a version containing the new checks."
+  
+  # TODO: Test if the end state is as was requested.
+
+  # Put the info about new checks in the instances file.
+  debug "Finished setting checks."
+}
+
+print_check() {
+  local CHECK="${1}"
+  local CHECK_NAME=
+  local CHECK_PARAMS=
+
+  case 
+}
+
+prepare_the_client_for_a_database_check(){
+  # Icinga database check requires a special user and a special
+  # database, which allow to check if the database is working from the
+  # inside.
+  local TARGET_HOST="${1}"
+
+  # Create a new database user on the client.
+
+  # Test if it works.
+
+  # Write the new user and password to the instances file.
+}
+
+
+insert_in_file(){
+  # Inserts file inside another file.
+  
+  # Error if wrong number of arguments.
+  [[ $# -ne 3 ]] && die 'Wrong number of arguments for insert.'
+  source_file="${1}"      # File to insert.
+  destination_file="${2}" # Destination file.
+  line_insert="${3}"      # Line to insert after.
+    
+  # Create a temporary file to hold results.
+  tempfile_ins=$(mktemp) || die "Failed to create a tempfile_ins."
+  trap 'rm -f ${tempfile_ins}; exit' EXIT
+
+  # Code block to create the new file.
+  {
+    head -"$line_insert" "$destination_file"
+    cat "$source_file" \
+      || die 'cat "$source_file"'
+    tail -n +$((++line_insert)) "$destination_file"
+  } > "$tempfile_ins"
+
+  # Inserting the new file in the place of the other.
+  cat "$tempfile_ins" > "$destination_file" \
+    || die 'cat "$tempfile_ins" > "$destination_file"'
+}
+
+
+backup_file(){
+  # One argument: Create a backup of $1 if it hasn't been backed up
+  # this minute.
+  # Two arguments: $1 is hostname in form host:XXX or host:HOSTNAME,
+  # $2 will be backed up.
+
+  debug "backup_file() run with ${*}"
+  # Set different variables depending on arguments.
+  local BACKED_FILE
+  local HOST
+  if [[ ${#} -eq 1 ]]; then
+    BACKED_FILE="${1}"
+    # Check if file exists.
+    if [[ ! -f ${BACKED_FILE} ]]; then
+      debug "File doesn't exist: ${BACKED_FILE}."
+      return 0
+    fi
+    # Check if there was backup done this minute.
+    if [[ -f ${BACKED_FILE}.bak.$(date +%F-%H:%M) ]]\
+       &>/dev/null
+    then
+      debug "File already backed up, time of backup:$(date +%F-%H:%M)."
+    else
+      # Backup instances.
+      debug "Backing up ${BACKED_FILE} to .bak.$(date +%F-%H:%M)."
+      cp "${BACKED_FILE}"{,.bak."$(date +%F-%H:%M)"} \
+        || die 'cp "${BACKED_FILE}"{,.bak."$(date +%F-%H:%M)"}'
+    fi
+  # Check if ${1} starts with 'host'.
+  elif [[ "${1%%:*}" == 'host' ]]; then
+    # If true set HOST to the part of ${1} after 'host:'.
+    HOST="${1#*:}"
+    BACKED_FILE="${2}"
+    # Check if file exists.
+    if essh -e "${HOST}" sudo test ! -f "${BACKED_FILE}"; then
+      debug "File doesn't exist: ${BACKED_FILE}."
+      return 0
+    fi
+    # Check if there was backup done this minute.
+    if ! essh -s -e "${HOST}" \
+            "test ! -f ${BACKED_FILE}.bak.$(date +%F-%H:%M)"
+    then
+      debug "File already backed up, time of backup:$(date +%F-%H:%M)."
+    else
+      # Backup instances.
+      debug "Backing up ${BACKED_FILE} to .bak.$(date +%F-%H:%M)."
+      essh -s "${HOST}" \
+          "cp ${BACKED_FILE}{,.bak.$(date +%F-%H:%M)}" \
+        || die "Failed to backup file on remote host.\n\
+           Host: ${HOST}\n\
+           File: ${BACKED_FILE}"
+    fi
+  fi
+  # Either way, file got backed up
+  return 0
+}
+
+test_name(){
+  # Tests if name contains only alphanumerics or hyphens '-'.
+  # This is a requirement for a hosntame.
+  local name
+  name="${1}"
+
+  if [[ "${name}" =~ ^[a-zA-Z0-9-]+$ ]]; then
+    debug "Name \"${name}\" contains only alphanumerics or '-'."
+    return 0
+  else
+    die "Illegal name: \"${name}\".\n\tNames can contain only alphanumerics and '-'."
+    return 1
+  fi
+}
+
+
+main(){
+# MAIN FUNCTION
+
+  # Exit if not enough arguments.
+  if [[ ${#} -lt 2 && "${1}" != 'list' ]]; then
+    echo "Not enough arguments - ${#}." >&2
+    usage "${1}"
+    exit 1
+  fi
+  
+  # -h/--help: If the help option is used in combination with mode
+  # arguments like add, edit or list, a detailed usage help should be
+  # displayed, listing all options and some examples.
+  for ARG in "${@}"; do
+    if [[ "${ARG}" = 'help' ||\
+            "${ARG}" = '-h' ||\
+            "${ARG}" = '--help' ]]; then
+      usage "${1}"
+      exit 1
+    fi
+  done
+              
+  # Assign first two variables to action-keyword and target hostname.
+  KEYWORD="${1}"
+  shift
+  TARGET="${1}"
+  shift
+  
+  # Parse options.
+  while getopts D:a:wid OPTION ; do
+    case ${OPTION} in
+      a)
+	IP_ADDRESS="${OPTARG}"
+	;;
+      D)
+	DB_ROOT_PASS="${OPTARG}"
+	;;
+      d)
+        DRY_FLAG='1'
+        ;;
+      i)
+        CHECKS_FROM_INS_FILE='1'
+        ;;
+      w)
+        CHECKS_FROM_WIZARD='1'
+        ;;
+      ?)
+        echo "Wrong option: ${OPTION}." >&2
+        usage "${KEYWORD}"
+        ;;
+    esac
+  done
+
+  # Remove the options while leaving the remaining arguments.
+  shift "$(( OPTIND - 1 ))"
+  
+  # Case statement based on the first argument (add,edit,list,help)
+  case "${KEYWORD}" in
+
+    add)
+    # Adds a new machine to monitoring and sets checks on the
+    # machine. Data comes from either arguments, wizard or is found in
+    # the instances file.
+
+      # Check if hostname is a legal hostname.
+      test_name "${TARGET}"
+
+      # Check if user supplied an ip address.
+      if [[ ! -v IP_ADDRESS ]]; then
+        echo "Use the -a option to supply ip address for the add command." >&2
+        usage "${KEYWORD}"
+      fi
+      
+      # Add server.
+      prepare_a_new_host "${TARGET}" "${IP_ADDRESS}" \
+        || die "Failed to prepare ${TARGET} as an icinga agent host."
+      
+      
+      # Set checks for the server.
+      set_checks_to_new_values "${TARGET}" "${@}" \
+        || die "Failed to set new checks for ${TARGET}."
+      
+      # List information about the server.
+      echo "Information about the target host:"
+      ins list "${PROJECT}" "${TARGET}" "${INSTANCES_FILE}"
+    ;;
+    
+    edit)
+      # Set checks for the server.
+      set_checks_to_new_values "${@}"
+      
+      # List information about the server.
+      ins list "${PROJECT}" "${TARGET}" "${INSTANCES_FILE}"
+    ;;
+
+    list)
+      # If a hostname is submitted, list server matching hostname.
+      if [[ -n "${TARGET}" ]]; then
+        ins list "${PROJECT}" "${TARGET}" "${INSTANCES_FILE}"
+      fi
+      
+      # Else list all info on all servers.
+      ins list "${PROJECT}" all "${INSTANCES_FILE}"
+    ;;
+    
+    *)
+      usage
+    ;;
+  esac
+}
+
+main "${@}"
+exit 0

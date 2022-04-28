@@ -1,0 +1,94 @@
+#!/bin/bash
+# Run a vagrant command ($1->) on a vagrant server (last argument).
+#
+# Script gets the vagrant VM's hash (based on the last argument) and
+# uses it to execute vagrant commands against the machine. 
+#
+# Server must have been used recently for this script to work.
+#
+# Updated by Ignacy on to. 24. juni 14:18:09 +0200 2021
+# Updated by Ignacy on Sat 26 Feb 2022 10:31:15 AM CET
+
+
+#Debugging variables
+#set -e
+#set -x
+debug_flag=0
+
+# GLOBAL VARIABLES
+# Cache file for 'vagrant global-status' output.
+cache_file="/var/tmp/.wagrant_cache"
+
+# FUNCTIONS
+die(){
+# Exit on fail.
+  local error_msg="${*}"
+  echo -e "Error in '${0##*/}':\n $error_msg" >&2
+  echo "Exiting $0." >&2
+  exit 1
+}
+
+debug(){
+# Print debug messages if in debug mode.
+  if [[ debug_flag -eq 1 ]]; then
+    local debug_message="${*}"
+    echo -e "debug: $debug_message" >&2
+  fi
+}
+
+
+
+# Create cache cache_file if it doesn't exist
+if [[ ! ( -e $cache_file ) ]]
+then vagrant global-status --prune > "$cache_file" \
+    || die 'then vagrant global-status --prune > $cache_file'
+fi
+
+# Exit if can't read the cache_file.
+if [[ ! -r "$cache_file" ]]; then
+  die "Can't read ${cache_file}."
+fi
+
+# Refresh the cache_file if older than 60 seconds
+age_of_file_in_sec=$(stat --format=%Y "$cache_file")
+time_in_sec=$(date +%s)
+if [[ age_of_file_in_sec -le $(( time_in_sec - 60 )) ]]
+then
+  debug "Cache older than 60s, running vagrant global-status --prune."
+  vagrant global-status --prune > "$cache_file" \
+    || die 'vagrant global-status --prune > $cache_file'
+fi
+
+# Putting all but the last parameter (server name) into the command
+# string to be run against the server.
+vagrant_command="${1}"
+for (( i=2; i < ${#} && ${#} > 2 ; i++)); do
+  vagrant_command+=" ${i}"
+done
+debug "vagrant command is ${vagrant_command}."
+
+# Indirect substitution with '!' to get the value of the last
+# argument of the script.
+vagrant_hostname="${!#}"
+debug "vagrant hostname is ${vagrant_hostname}."
+
+# Get the hash of the machine to be able to use 'vagrant' command
+# outside of project's directory.
+vagrant_hash="$( awk '/'"$vagrant_hostname"'/ { print $1 }'\
+		    "$cache_file" )"
+debug "Hash for machine '$vagrant_hostname' is: ${vagrant_hash}."
+# Exit if there is no hash.
+if [[ -z "$vagrant_hash" ]]; then
+  debug "vagrant_hash field empty."
+  die "Can't find hash for '${vagrant_hostname}', does it exist?"
+fi
+
+
+# Execute vagrant command against the machine's hash.
+debug "wagrant executing: 'vagrant $vagrant_command $vagrant_hash'"
+vagrant "$vagrant_command" "$vagrant_hash" \
+  || die "vagrant '$vagrant_command' '$vagrant_hash'"
+
+# Finished successfully :)
+exit 0
+
